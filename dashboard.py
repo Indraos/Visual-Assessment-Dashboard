@@ -1,198 +1,251 @@
-# -*- coding: utf-8 -*-
+#!/usr/bin/python
+"""
+Dashboard for assessment using Natural Language Processing.
+
+Run python3 dashboard.py in a terminal to serve a local copy of the dashboard
+
+Copyright (C) 2019 Andreas Haupt
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+import io
+import base64
+import pickle
+import os
+from typing import List, Tuple, BinaryIO, Optional
+
 import dash
-from dash.dependencies import Input, Output, State
+from dash import dependencies
 import dash_core_components as dcc
 import dash_html_components as html
-from dash_html_components import Div, Span
-import bs4 as bs
 import dash_bootstrap_components as dbc
 import dash_daq as daq
-import base64                                                                                                                                                  
-import datetime
-import json
-import plotly
-import io
-import numpy as np
-from base64 import decodestring
-import codecs
-import eli5
-from eli5.lime import TextExplainer
+import eli5.lime
+import bs4
+import flask_caching
 import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.svm import SVC
-from sklearn.decomposition import TruncatedSVD
-from sklearn.pipeline import Pipeline, make_pipeline
-import pickle
-from flask_caching import Cache
-import re
 
-CACHE_CONFIG = {
-    'CACHE_TYPE': 'filesystem',
-    'CACHE_DIR': '.'
-}
+from sklearn.feature_extraction import text
+from sklearn import svm
+from sklearn import decomposition
+from sklearn import pipeline
 
-navbar = dbc.NavbarSimple(
-    brand="Assessment Dashboard",
-    brand_href="#",
-    sticky="top",
-)
+NAVBAR = dbc.NavbarSimple(brand="Assessment Dashboard",
+                          brand_href="#",
+                          sticky="top")
 
-body = dbc.Container(
+EXPLAINING_TEXT = (
+    "Please upload a"
+    "[Tab-separated file](https://en.wikipedia.org/wiki/Tab-separated_values) "
+    "that has columns 'Essay' and 'Grade'. Our system will try to visualize "
+    "important words for your grading decision. After uploading, it might take "
+    "up to a few minutes to calculate, which words are important, then going "
+    "through the submissions should go fairly quickly.")
+
+BODY = dbc.Container(
     [
-        dbc.Row(
-            [
-                dbc.Col(
-                    [
-                        html.H2("How to use this visualisation"),
-                        dcc.Markdown(
-                            """
-                            Please upload a [Tab-separated file](https://en.wikipedia.org/wiki/Tab-separated_values) that has columns "Essay" and "Grade". Our system will try to visualize important words for your grading decision. After uploading, it might take up to a few minutes to calculate, which words are important, then going through the submissions should go fairly quickly.
-                            """
-                        ),
-                        dcc.Upload(
-                            id='upload-corpus',
-                            children=html.Div([
-                                'Drag and Drop or ',
-                                html.A('Select Files')
-                            ]),
-                            style={
-                                'width': '95%',
-                                'height': '60px',
-                                'lineHeight': '60px',
-                                'borderWidth': '1px',
-                                'borderStyle': 'dashed',
-                                'borderRadius': '5px',
-                                'textAlign': 'center',
-                                'margin': '10px'
-                            },                                                                                                                                                 
-                            multiple=False
-                        ),
-                    ],
-                    md=4,
-                ),
-                dbc.Col(
-                    [
-                            daq.NumericInput(
-                            disabled=True,
-                            id="input-num-submission"), 
-                            html.Div(
-                                id="output-markdown-text")
-                    ]
-                ),
-            ]
-        )
+        dbc.Row([
+            dbc.Col(
+                [
+                    html.H2("How to use this visualisation?"),
+                    dcc.Markdown(EXPLAINING_TEXT),
+                    dcc.Upload(id="upload-corpus",
+                               children=html.Div([
+                                   "Drag and Drop or ",
+                                   html.A("Select Files")
+                               ]),
+                               style={
+                                   "width": "95%",
+                                   "height": "60px",
+                                   "lineHeight": "60px",
+                                   "borderWidth": "1px",
+                                   "borderStyle": "dashed",
+                                   "borderRadius": "5px",
+                                   "textAlign": "center",
+                                   "margin": "10px"
+                               },
+                               multiple=False),
+                ],
+                md=4,
+            ),
+            dbc.Col([
+                daq.NumericInput(  # pylint: disable=no-member
+                    disabled=True,
+                    id="input-num-submission"),
+                html.Div(id="output-markdown-text")
+            ]),
+        ])
     ],
     className="mt-4",
 )
 
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.CERULEAN])
-cache = Cache(app.server,config=CACHE_CONFIG)
-app.layout = html.Div([navbar, body])
+APP = dash.Dash(__name__, external_stylesheets=[dbc.themes.CERULEAN])
+CACHE = flask_caching.Cache(APP.server,
+                            config={
+                                "CACHE_TYPE": "filesystem",
+                                "CACHE_DIR": "./.flask_cache"
+                            })
+APP.layout = html.Div([NAVBAR, BODY])
 
 
+def _html_helper(raw_string: str) -> List[html.Span]:
+    """
+    Extracts a list of colored spans from string
 
-def convert_html_to_dash(el,style = None):
-    HTML_CONSTRUCTS =  {'span'}
-    def __extract_style(el):
-        if not el.attrs.get("style"):
-            return None
-        return {k.strip():v.strip() for k,v in [x.split(": ") for x in el.attrs["style"].split(";")] if k != "background-color"}
-    if type(el) is str:
-        return convert_html_to_dash(bs.BeautifulSoup(el,'html.parser'))
-    if type(el) == bs.element.NavigableString:
-        return str(el)
-    else:
-        name = el.name
-        style = __extract_style(el) if style is None else style
-        contents = [convert_html_to_dash(x) for x in el.contents]
-        if name.title().lower() not in HTML_CONSTRUCTS:        
-            return contents[0] if len(contents)==1 else html.Div(contents)
-        return getattr(html,name.title())(contents,style = style)
+    Args:
+        raw_string: HTML string that is output by an eli5.TextExplainer instance
+            upon method execution of show_prediction
+
+    Returns:
+        A list of dcc.html.Spans that encode the color
+
+    >>> _html_helper("<span style={opacity=0.88}> </span>")
+    [Span(' ')]
+    """
+    soup = bs4.BeautifulSoup(raw_string, "html.parser")
+    span_list = []
+    for span in soup.find_all("span"):
+        assert len(span.get("style").split(";")) < 3, "malformed input string"
+        if len(span.get("style").split(";")) == 2:
+            color = span.get("style").split(";")[0].split(":")[1]
+            span_list.append(html.Span(span.get_text(), style={'color':
+                                                               color}))
+        else:
+            span_list.append(html.Span(span.get_text()))
+    return span_list
 
 
+@APP.callback([
+    dependencies.Output("input-num-submission", "label"),
+    dependencies.Output("input-num-submission", "labelPosition"),
+    dependencies.Output("input-num-submission", "value"),
+    dependencies.Output("input-num-submission", "min"),
+    dependencies.Output("input-num-submission", "max"),
+    dependencies.Output("input-num-submission", "disabled")
+], [dependencies.Input("upload-corpus", "contents")],
+              [dependencies.State("upload-corpus", "filename")])
+def parse_corpus(contents: str,
+                 filename: str) -> Tuple[str, str, int, int, int, bool]:
+    """
+    Parse submissions and train a classifier
 
-@app.callback([Output('input-num-submission', 'label'),
-                Output('input-num-submission', 'labelPosition'),
-                Output('input-num-submission', 'value'),
-                Output('input-num-submission', 'min'),
-                Output('input-num-submission', 'max'),
-                Output('input-num-submission', 'disabled')],
-              [Input('upload-corpus', 'contents')],
-              [State('upload-corpus', 'filename')])
-def parse_corpus(contents, filename):
+    Parses a file input through the dashboard's upload component, learns a classifier and
+    trains a sklearn classifier. As a side effect, it stores test data and the classifier
+    in local storage.
+
+    Args:
+        Contents: Binary input of the file.
+        filename: string denoting the filename of the file.
+    """
     if not contents:
-        return "", None, None, None, None, None
-    content_type, content_string = contents.split(',')
+        return "", "", 0, 0, 0, False
+    _, content_string = contents.split(",")
     decoded = base64.b64decode(content_string)
-    try:
-        df = pd.read_csv(
-                io.StringIO(decoded.decode('utf-8')),sep='\t')
-    except Exception as e:
-        print(e)
-        return html.Div([
-            'There was an error processing this file.'
-        ])
-    df["Grade"].astype("Int64")
-    train = df[df["Grade"].notnull()]
-    test = df[~df["Grade"].notnull()]
+    data = pd.read_csv(io.StringIO(decoded.decode("utf-8")), sep="\t")
+    data["Grade"].astype("Int64")
+    train = data[data["Grade"].notnull()]
     train_data = train["Essay"]
     train_labels = train["Grade"]
-    test_data = test["Essay"]
     train_labels_lower_quartile = train_labels.quantile(q=.25)
     train_labels = (train_labels > train_labels_lower_quartile)
-    target_names = ["Low Grade", "High Grade"]
+    clf = classifier(train_data, train_labels)
+    with open("classifier_for_{}.pickle".format(filename), "wb") as out_file:
+        pickle.dump(clf, out_file)
+    test_data = data[data["Grade"].isnull()]["Essay"]
+    with open("{}.pickle".format(filename), "wb") as out_file:
+        pickle.dump(list(test_data), out_file)
+    return ("Index of ungraded submission in file {}".format(filename),
+            "right", 1, 1, len(test_data), False)
 
-    vec = TfidfVectorizer(min_df=3, stop_words='english',
-                          ngram_range=(1, 2))
-    svd = TruncatedSVD(n_components=100, n_iter=7, random_state=42)
-    lsa = make_pipeline(vec, svd)
 
-    clf = SVC(C=150, gamma=2e-2, probability=True)
-    pipe = make_pipeline(lsa, clf)
+def classifier(train_data: pd.Series, train_labels) -> pipeline.Pipeline:
+    """
+    Trains a classifier on labeled training data.
+
+    Trains an inverse document frequency-vectorised support-vector machine after
+    dimension reduction by a singular value decomposition.
+
+    Args:
+        train_data: A pd.Series containing the essays as strings
+        train_labels: A pd.Series containing the grades as integers.
+
+    Returns:
+        An sklearn.Classifier trained on the input data.
+    """
+    vec = text.TfidfVectorizer(min_df=3,
+                               stop_words="english",
+                               ngram_range=(1, 2))
+    svd = decomposition.TruncatedSVD()
+    lsa = pipeline.make_pipeline(vec, svd)
+    clf = svm.SVC(gamma="scale", probability=True)
+    pipe = pipeline.make_pipeline(lsa, clf)
     pipe.fit(train_data, train_labels)
-    with open("classifier.pickle", 'wb') as out_file:
-        pickle.dump(pipe, out_file)
-    with open("data.pickle", 'wb') as out_file:
-        pickle.dump(train_data, out_file)
-    return ['Index of ungraded submission in file {}'.format(filename),
-            'right',
-            1,
-            1,
-            len(test_data),
-            False]
+    return pipe
 
 
-@cache.memoize()
-def load_text(value):
-    with open("data.pickle",'rb') as in_file:
-        return pickle.load(in_file)[value + 1]
+@CACHE.memoize(timeout=600)
+def load_classifier(filename: str) -> pipeline.Pipeline:
+    """
+    Retrieve the classifier.
 
-@cache.memoize()
-def load_classifier():
-    with open("classifier.pickle",'rb') as in_file:
+    Retrieve the classifier. Utility function to be able to cache the classifier.
+
+    Args:
+        filename: To ensure that for a new file it is not read from the cache
+
+    Returns:
+        An sklearn.Classifier imported from pickle.
+    """
+    with open("classifier_for_{}.pickle".format(filename), "rb") as in_file:
         return pickle.load(in_file)
 
 
-@app.callback(Output('output-markdown-text', 'children'),
-              [Input('input-num-submission', 'value')])
-@cache.memoize()
-def explain_text(value):
+@APP.callback(dependencies.Output("output-markdown-text", "children"),
+              [dependencies.Input("input-num-submission", "value")],
+              [dependencies.State("upload-corpus", "filename")])
+@CACHE.memoize(timeout=600)
+def explain_text(value: int, filename: str) -> Optional[List[html.Span]]:
+    """
+    Return a colorful HTML output given value and filename of file to be explained.
+
+    Train a TextExplainer instance on the data stored in filename and transform it
+    for use with dash.
+
+    Args:
+        value: integer denoting the index of the ungraded submission to be graded
+        filename: a string giving the filename. Needed to not read from cache when not intended.
+
+    Returns:
+        A list of html.Spans that return a colorful text output.
+    """
     if not value:
         return None
-    te = TextExplainer(random_state=42)
-    te.fit(load_text(value), load_classifier().predict_proba)
-    prediction_string = te.show_prediction().data
-    prediction_string = prediction_string[prediction_string.find("<span style"):-14]
-    return html_helper(prediction_string)
+    text_explainer = eli5.lime.TextExplainer(random_state=42)
+    with open(filename + ".pickle", "rb") as in_file:
+        submission = pickle.load(in_file)[value - 1]
+    text_explainer.fit(submission, load_classifier(filename).predict_proba)
+    prediction_string = text_explainer.show_prediction(top=(10, 10),
+                                                       targets=[1]).data
+    return _html_helper(prediction_string)
 
-def html_helper(raw_string):
-    span_list = raw_string.split("><")
-    return_spans = []
-    for span in span_list[:-1]:
-        word = span[:-6].split(">")[1]
-        opacity = span.split(">")[0][-5:-2]
-        return_spans.append(html.Span(children=word,style={"opacity":.5+.5*float(opacity)}))
-    return return_spans
 
-if __name__ == '__main__':
-    app.run_server(debug=True)
+if __name__ == "__main__":
+    import doctest
+    doctest.testmod()
+    APP.run_server()
