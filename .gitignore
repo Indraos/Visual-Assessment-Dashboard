@@ -1,3 +1,12 @@
+# Caching
+.DS_Store
+
+# Mac OS
+.flask_cache/
+
+# Type check
+.pytype/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
